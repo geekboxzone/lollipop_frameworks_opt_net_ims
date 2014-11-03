@@ -412,7 +412,19 @@ public class ImsCall implements ICall {
     // Media session to control media (audio/video) operations for an IMS call
     private ImsStreamMediaSession mMediaSession = null;
 
+    // The temporary ImsCallSession that could represent the merged call once
+    // we receive notification that the merge was successful.
     private ImsCallSession mTransientConferenceSession = null;
+    // While a merge is progressing, we bury any session termination requests
+    // made on the original ImsCallSession until we have closure on the merge request
+    // If the request ultimately fails, we need to act on the termination request
+    // that we buried temporarily. We do this because we feel that timing issues could
+    // cause the termination request to occur just because the merge is succeeding.
+    private boolean mSessionEndDuringMerge = false;
+    // Just like mSessionEndDuringMerge, we need to keep track of the reason why the
+    // termination request was made on the original session in case we need to act
+    // on it in the case of a merge failure.
+    private ImsReasonInfo mSessionEndDuringMergeReasonInfo = null;
 
     /**
      * Create an IMS call object.
@@ -1080,7 +1092,17 @@ public class ImsCall implements ICall {
             if (mHold || (mContext.getResources().getBoolean(
                     com.android.internal.R.bool.skipHoldBeforeMerge))) {
                 mSession.merge();
-                mUpdateRequest = UPDATE_MERGE;
+
+                // Check to see if there is an owner to a valid call group.  If this is the
+                // case, then we already have a conference call.
+                if (mCallGroup != null && mCallGroup.getOwner() == null) {
+                    // We only set UPDATE_MERGE when we are adding the first
+                    // calls to the Conference.  If there is already a conference
+                    // no special handling is needed.The existing conference
+                    // session will just go active and any other sessions will be terminated
+                    // if needed.  There will be no merge failed callback.
+                    mUpdateRequest = UPDATE_MERGE;
+                }
             } else {
                 // This code basically says, we need to explicitly hold before requesting a merge
                 // when we get the callback that the hold was successful (or failed), we should
@@ -1618,6 +1640,59 @@ public class ImsCall implements ICall {
         }
     }
 
+    /**
+     * Perform all cleanup and notification around the termination of a session.
+     * Note that there are 2 distinct modes of operation.  The first is when
+     * we receive a session termination on the primary session when we are
+     * in the processing of merging.  The second is when we are not merging anything
+     * and the call is terminated.
+     *
+     * @param reasonInfo The reason for the session termination
+     */
+    private void processCallTerminated(ImsReasonInfo reasonInfo) {
+        if (DBG) {
+            String sessionString = mSession != null ? mSession.toString() : "null";
+            String transientSessionString = mTransientConferenceSession != null ?
+                    mTransientConferenceSession.toString() : "null";
+            String reasonString = reasonInfo != null ? reasonInfo.toString() : "null";
+            log("processCallTerminated :: session=" + sessionString + " transientSession=" +
+                    transientSessionString + " reason=" + reasonString);
+        }
+
+        ImsCall.Listener listener = null;
+
+        synchronized(ImsCall.this) {
+            if (mUpdateRequest == UPDATE_MERGE) {
+                // Since we are in the process of a merge, this trigger means something
+                // else because it is probably due to the merge happening vs. the
+                // session is really terminated. Let's flag this and revisit if
+                // the merge() ends up failing because we will need to take action on the
+                // mSession in that case since the termination was not due to the merge
+                // succeeding.
+                if (DBG) {
+                    log("processCallTerminated :: burying termination during ongoing merge.");
+                }
+                mSessionEndDuringMerge = true;
+                mSessionEndDuringMergeReasonInfo = reasonInfo;
+                return;
+            }
+
+            if (mCallGroup != null) {
+                notifyConferenceSessionTerminated(reasonInfo);
+            } else {
+                listener = mListener;
+                clear(reasonInfo);
+            }
+        }
+
+        if (listener != null) {
+            try {
+                listener.onCallTerminated(ImsCall.this, reasonInfo);
+            } catch (Throwable t) {
+                loge("callSessionTerminated :: ", t);
+            }
+        }
+    }
 
     /**
      * This function determines if the ImsCallSession is our actual ImsCallSession or if is
@@ -1639,31 +1714,49 @@ public class ImsCall implements ICall {
 
     /**
      * We received a callback from ImsCallSession that a merge was complete. Clean up all
-     * internal state to represent this state change.
+     * internal state to represent this state change. This function will be called when
+     * the transient conference session goes active or we get an explicit merge complete
+     * callback on the transient session.
      *
-     * @param session The {@link ImsCallSession} that is the host of this conference.
      */
-    private void processMergeComplete(ImsCallSession session) {
-        // If mTransientConferenceSession is set, this means that this is a newly created
-        // conference. Otherwise, we are adding to an existing conference.
+    private void processMergeComplete() {
+        if (DBG) {
+            String sessionString = mSession != null ? mSession.toString() : "null";
+            String transientSessionString = mTransientConferenceSession != null ?
+                    mTransientConferenceSession.toString() : "null";
+            log("processMergeComplete :: session=" + sessionString + " transientSession=" +
+                    transientSessionString);
+        }
+
         ImsCall.Listener listener;
         synchronized(ImsCall.this) {
             listener = mListener;
-            // TODO: See if we can use the session param to do some further checks here.
             if (mTransientConferenceSession != null) {
-                // We need to replace our ImsCallSession with this new one after adjusting
-                // the listeners on the session.
+                // Swap out the underlying sessions after shutting down the existing session.
                 mSession.setListener(null);
-                mTransientConferenceSession.setListener(createCallSessionListener());
                 mSession = mTransientConferenceSession;
+                // We need to set ourselves as the owner of the call group to indicate that
+                // a conference call is in progress.
+                mCallGroup.setOwner(ImsCall.this);
+                listener = mListener;
+            } else {
+                // This is an interesting state that needs to be logged since we
+                // should only be going through this workflow for new conference calls
+                // and not merges into existing conferences (which a null transient
+                // session would imply)
+                log("processMergeComplete :: ERROR no transient session");
             }
+            // Clear some flags.  If the merge eventually worked, we can safely
+            // ignore the call terminated message for the old session since we closed it already.
+            mSessionEndDuringMerge = false;
+            mSessionEndDuringMergeReasonInfo = null;
             mUpdateRequest = UPDATE_NONE;
         }
         if (listener != null) {
             try {
                 listener.onCallMerged(ImsCall.this);
             } catch (Throwable t) {
-                loge("callSessionMergeStarted :: ", t);
+                loge("processMergeComplete :: ", t);
             }
         }
 
@@ -1674,28 +1767,59 @@ public class ImsCall implements ICall {
      * We received a callback from ImsCallSession that a merge failed. Clean up all
      * internal state to represent this state change.
      *
-     * @param session The {@link ImsCallSession} that is the host of this conference.
      * @param reasonInfo The {@link ImsReasonInfo} why the merge failed.
      */
-    private void processMergeFailed(ImsCallSession session, ImsReasonInfo reasonInfo) {
-        // If mTransientConferenceSession is set, this means that this is a newly created
-        // conference. Otherwise, we are adding to an existing conference.
+    private void processMergeFailed(ImsReasonInfo reasonInfo) {
+        if (DBG) {
+            String sessionString = mSession != null ? mSession.toString() : "null";
+            String transientSessionString = mTransientConferenceSession != null ?
+                    mTransientConferenceSession.toString() : "null";
+            String reasonString = reasonInfo != null ? reasonInfo.toString() : "null";
+            log("processMergeFailed :: session=" + sessionString + " transientSession=" +
+                    transientSessionString + " reason=" + reasonString);
+        }
+
         ImsCall.Listener listener;
+        boolean notifyFailure = false;
+        ImsReasonInfo notifyFailureReasonInfo = null;
+
         synchronized(ImsCall.this) {
             listener = mListener;
-            // TODO: See if we can use the session param to do some further checks here.
             if (mTransientConferenceSession != null) {
                 // Clean up any work that we performed on the transient session.
                 mTransientConferenceSession.setListener(null);
                 mTransientConferenceSession = null;
+                listener = mListener;
+                if (mSessionEndDuringMerge) {
+                    // Set some local variables that will send out a notification about a
+                    // previously buried termination callback for our primary session now that
+                    // we know that this is not due to the conference call merging succesfully.
+                    if (DBG) {
+                        log("processMergeFailed :: following up on a terminate during the merge");
+                    }
+                    notifyFailure = true;
+                    notifyFailureReasonInfo = mSessionEndDuringMergeReasonInfo;
+                }
+            } else {
+                // This is an interesting state that needs to be logged since we
+                // should only be going through this workflow for new conference calls
+                // and not merges into existing conferences (which a null transient
+                // session would imply)
+                log("processMergeFailed - ERROR no transient session");
             }
+            mSessionEndDuringMerge = false;
+            mSessionEndDuringMergeReasonInfo = null;
             mUpdateRequest = UPDATE_NONE;
         }
         if (listener != null) {
             try {
+                // TODO: are both of these callbacks necessary?
                 listener.onCallMergeFailed(ImsCall.this, reasonInfo);
+                if (notifyFailure) {
+                    processCallTerminated(notifyFailureReasonInfo);
+                }
             } catch (Throwable t) {
-                loge("callSessionMergeFailed :: ", t);
+                loge("processMergeFailed :: ", t);
             }
         }
         return;
@@ -1728,7 +1852,8 @@ public class ImsCall implements ICall {
         @Override
         public void callSessionProgressing(ImsCallSession session, ImsStreamMediaProfile profile) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionProgressing :: not supported for conference session=" + session);
+                log("callSessionProgressing :: not supported for transient conference session=" +
+                        session);
                 return;
             }
 
@@ -1754,13 +1879,18 @@ public class ImsCall implements ICall {
 
         @Override
         public void callSessionStarted(ImsCallSession session, ImsCallProfile profile) {
-            if (isTransientConferenceSession(session)) {
-                log("callSessionStarted :: not supported for conference session=" + session);
-                return;
-            }
-
             if (DBG) {
                 log("callSessionStarted :: session=" + session + ", profile=" + profile);
+            }
+
+            if (isTransientConferenceSession(session)) {
+                log("callSessionStarted :: transient conference session resumed session=" +
+                        session);
+                // If we get a resume on the transient session, this means that the merge
+                // was completed, let's process it are skip the rest of the processing in
+                // this callback.
+                processMergeComplete();
+                return;
             }
 
             ImsCall.Listener listener;
@@ -1782,7 +1912,8 @@ public class ImsCall implements ICall {
         @Override
         public void callSessionStartFailed(ImsCallSession session, ImsReasonInfo reasonInfo) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionStartFailed :: not supported for conference session=" + session);
+                log("callSessionStartFailed :: not supported for transient conference session=" +
+                        session);
                 return;
             }
 
@@ -1810,64 +1941,22 @@ public class ImsCall implements ICall {
         @Override
         public void callSessionTerminated(ImsCallSession session, ImsReasonInfo reasonInfo) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionTerminated :: not supported for conference session=" + session);
+                log("callSessionTerminated :: not supported for transient conference session=" +
+                        session);
                 return;
             }
 
             if (DBG) {
-                log("callSessionTerminated :: session=" + session +
-                        ", reasonInfo=" + reasonInfo);
+                log("callSessionTerminated :: session=" + session + ", reasonInfo=" + reasonInfo);
             }
 
-            ImsCall.Listener listener = null;
-
-            synchronized(ImsCall.this) {
-                // Let's explicitly handle this situation here...
-                // The ImsCallSession that has just notified that it was terminated could be in the
-                // state where it is waiting for a merge to happen. If this is the case, let's just
-                // assume that the merge is going to succeed but the callbacks are being done in the
-                // wrong order.  We would expect callSessionMergeComplete() to be called on the
-                // transient session first and then this call to the original merge() "host".
-                // If the timing is off, we could be getting this call first.
-                if (mUpdateRequest == UPDATE_MERGE) {
-                    if (mTransientConferenceSession != null) {
-                        log("callSessionTerminated() :: called while waiting for a new conference");
-                        // Let's assume that the merge will complete and the transient session will,
-                        // in fact, be our new session soon enough.
-                        mSession.setListener(null);
-                        mTransientConferenceSession.setListener(createCallSessionListener());
-                        mSession = mTransientConferenceSession;
-                        // At this point, we'll handle this conference call like it was a merge()
-                        // on an existing conference as opposed to creating a new conference. All
-                        // properly callbacks should be made.
-
-                        // TODO: Do we need to handle the case where the new ImsCallSession still
-                        // fails to merge after this?  Should be a very unlikely scenario.
-                        return;
-                    }
-                }
-
-                if (mCallGroup != null) {
-                    notifyConferenceSessionTerminated(reasonInfo);
-                } else {
-                    listener = mListener;
-                    clear(reasonInfo);
-                }
-            }
-
-            if (listener != null) {
-                try {
-                    listener.onCallTerminated(ImsCall.this, reasonInfo);
-                } catch (Throwable t) {
-                    loge("callSessionTerminated :: ", t);
-                }
-            }
+            processCallTerminated(reasonInfo);
         }
 
         @Override
         public void callSessionHeld(ImsCallSession session, ImsCallProfile profile) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionHeld :: not supported for conference session=" + session);
+                log("callSessionHeld :: not supported for transient conference session=" + session);
                 return;
             }
 
@@ -1905,7 +1994,8 @@ public class ImsCall implements ICall {
         @Override
         public void callSessionHoldFailed(ImsCallSession session, ImsReasonInfo reasonInfo) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionHoldFailed :: not supported for conference session=" + session);
+                log("callSessionHoldFailed :: not supported for transient conference session=" +
+                        session);
                 return;
             }
 
@@ -1947,7 +2037,8 @@ public class ImsCall implements ICall {
         @Override
         public void callSessionHoldReceived(ImsCallSession session, ImsCallProfile profile) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionHoldReceived :: not supported for conference session=" + session);
+                log("callSessionHoldReceived :: not supported for transient conference session=" +
+                        session);
                 return;
             }
 
@@ -1974,7 +2065,8 @@ public class ImsCall implements ICall {
         @Override
         public void callSessionResumed(ImsCallSession session, ImsCallProfile profile) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionResumed :: not supported for conference session=" + session);
+                log("callSessionResumed :: not supported for transient conference session=" +
+                        session);
                 return;
             }
 
@@ -2006,7 +2098,8 @@ public class ImsCall implements ICall {
         @Override
         public void callSessionResumeFailed(ImsCallSession session, ImsReasonInfo reasonInfo) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionResumeFailed :: not supported for conference session=" + session);
+                log("callSessionResumeFailed :: not supported for transient conference session=" +
+                        session);
                 return;
             }
 
@@ -2034,7 +2127,8 @@ public class ImsCall implements ICall {
         @Override
         public void callSessionResumeReceived(ImsCallSession session, ImsCallProfile profile) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionResumeReceived :: not supported for conference session=" + session);
+                log("callSessionResumeReceived :: not supported for transient conference session=" +
+                        session);
                 return;
             }
 
@@ -2063,7 +2157,7 @@ public class ImsCall implements ICall {
         public void callSessionMergeStarted(ImsCallSession session,
                 ImsCallSession newSession, ImsCallProfile profile) {
             if (DBG) {
-                String sessionString = newSession == null ? "null" : newSession.toString();
+                String sessionString = session == null ? "null" : session.toString();
                 String newSessionString = newSession == null ? "null" : newSession.toString();
                 log("callSessionMergeStarted :: session=" + sessionString
                         + ", newSession=" + newSessionString + ", profile=" + profile);
@@ -2105,11 +2199,6 @@ public class ImsCall implements ICall {
                 mTransientConferenceSession.setListener(createCallSessionListener());
             }
 
-            // STOPSHIP: For now, let's force the complete callback since it is not coming
-            // from the vendor layer as of when this code was written.
-            log("callSessionMergeStarted ::  forcing a success callback");
-            callSessionMergeComplete(mTransientConferenceSession);
-
             return;
         }
 
@@ -2128,7 +2217,7 @@ public class ImsCall implements ICall {
             }
             // Let's let our parent ImsCall now that we received notification that
             // the merge was completed so we can set up our internal state properly
-            processMergeComplete(session);
+            processMergeComplete();
         }
 
         @Override
@@ -2148,13 +2237,14 @@ public class ImsCall implements ICall {
             }
             // Let's tell our parent ImsCall that the merge has failed and we need to clean
             // up any temporary, transient state.
-            processMergeFailed(session, reasonInfo);
+            processMergeFailed(reasonInfo);
         }
 
         @Override
         public void callSessionUpdated(ImsCallSession session, ImsCallProfile profile) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionUpdated :: not supported for conference session=" + session);
+                log("callSessionUpdated :: not supported for transient conference session=" +
+                        session);
                 return;
             }
 
@@ -2182,7 +2272,8 @@ public class ImsCall implements ICall {
         @Override
         public void callSessionUpdateFailed(ImsCallSession session, ImsReasonInfo reasonInfo) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionUpdateFailed :: not supported for conference session=" + session);
+                log("callSessionUpdateFailed :: not supported for transient conference session=" +
+                        session);
                 return;
             }
 
@@ -2210,7 +2301,8 @@ public class ImsCall implements ICall {
         @Override
         public void callSessionUpdateReceived(ImsCallSession session, ImsCallProfile profile) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionUpdateReceived :: not supported for conference session=" + session);
+                log("callSessionUpdateReceived :: not supported for transient conference " +
+                        "session=" + session);
                 return;
             }
 
@@ -2240,8 +2332,8 @@ public class ImsCall implements ICall {
         public void callSessionConferenceExtended(ImsCallSession session, ImsCallSession newSession,
                 ImsCallProfile profile) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionConferenceExtended :: not supported for conference session=" +
-                        session);
+                log("callSessionConferenceExtended :: not supported for transient conference " +
+                        "session=" + session);
                 return;
             }
 
@@ -2277,8 +2369,8 @@ public class ImsCall implements ICall {
         public void callSessionConferenceExtendFailed(ImsCallSession session,
                 ImsReasonInfo reasonInfo) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionConferenceExtendFailed :: not supported for conference session=" +
-                        session);
+                log("callSessionConferenceExtendFailed :: not supported for transient " +
+                        "conference session=" + session);
                 return;
             }
 
@@ -2307,8 +2399,8 @@ public class ImsCall implements ICall {
         public void callSessionConferenceExtendReceived(ImsCallSession session,
                 ImsCallSession newSession, ImsCallProfile profile) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionConferenceExtendReceived :: not supported for conference session=" +
-                        session);
+                log("callSessionConferenceExtendReceived :: not supported for transient " +
+                        "conference session=" + session);
                 return;
             }
 
@@ -2455,8 +2547,8 @@ public class ImsCall implements ICall {
         public void callSessionConferenceStateUpdated(ImsCallSession session,
                 ImsConferenceState state) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionConferenceStateUpdated :: not supported for conference session=" +
-                        session);
+                log("callSessionConferenceStateUpdated :: not supported for transient " +
+                        "conference session=" + session);
                 return;
             }
 
@@ -2472,8 +2564,8 @@ public class ImsCall implements ICall {
         public void callSessionUssdMessageReceived(ImsCallSession session, int mode,
                 String ussdMessage) {
             if (isTransientConferenceSession(session)) {
-                log("callSessionUssdMessageReceived :: not supported for conference session=" +
-                        session);
+                log("callSessionUssdMessageReceived :: not supported for transient " +
+                        "conference session=" + session);
                 return;
             }
 
