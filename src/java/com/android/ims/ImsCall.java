@@ -1501,6 +1501,8 @@ public class ImsCall implements ICall {
                     }
                 }
             }
+        } else if (!mCallGroup.isReferrer(ImsCall.this)) {
+            return;
         }
 
         listener = mListener;
@@ -1675,9 +1677,6 @@ public class ImsCall implements ICall {
                 return;
             }
 
-            // If this condition is satisfied, this call is either a part of
-            // a conference call or a call that is about to be merged into an
-            // existing conference call.
             if (mCallGroup != null) {
                 notifyConferenceSessionTerminated(reasonInfo);
             } else {
@@ -1941,8 +1940,9 @@ public class ImsCall implements ICall {
 
         @Override
         public void callSessionTerminated(ImsCallSession session, ImsReasonInfo reasonInfo) {
-            if (mSession != session) {
-                log("callSessionTerminated :: not supported for conference session=" + session);
+            if (isTransientConferenceSession(session)) {
+                log("callSessionTerminated :: not supported for transient conference session=" +
+                        session);
                 return;
             }
 
